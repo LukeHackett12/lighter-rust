@@ -1,6 +1,7 @@
 use crate::{
     config::LighterConfig,
     error::{LighterError, Result},
+    signer::FFISigner,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,108 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug)]
+enum AccountSubscription {
+    AccountAll { account_id: String },
+    AccountMarket { market_id: String, account_id: String },
+}
+
+impl AccountSubscription {
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(LighterError::Config(
+                "Account subscription identifier cannot be empty".into(),
+            ));
+        }
+
+        let normalized = trimmed.trim_matches('/');
+        if normalized.is_empty() {
+            return Err(LighterError::Config(format!(
+                "Invalid account subscription `{trimmed}`"
+            )));
+        }
+
+        if let Some(rest) = normalized.strip_prefix("account_market/") {
+            return Self::parse_market(rest, trimmed);
+        }
+
+        if let Some(rest) = normalized.strip_prefix("account_all/") {
+            return Self::parse_account(rest, trimmed);
+        }
+
+        let mut segments = normalized.split('/');
+        let first = segments.next().unwrap_or_default().trim();
+        let second = segments.next();
+
+        if let Some(second_part) = second {
+            if segments.next().is_some() {
+                return Err(LighterError::Config(format!(
+                    "Invalid account subscription `{trimmed}`"
+                )));
+            }
+            return Self::parse_market_parts(first, second_part.trim(), trimmed);
+        }
+
+        Self::parse_account(first, trimmed)
+    }
+
+    fn parse_account(segment: &str, raw: &str) -> Result<Self> {
+        let account_id = segment.trim();
+        if account_id.is_empty() {
+            return Err(LighterError::Config(format!(
+                "Invalid account subscription `{raw}`: missing account id"
+            )));
+        }
+
+        Ok(Self::AccountAll {
+            account_id: account_id.to_string(),
+        })
+    }
+
+    fn parse_market(segment: &str, raw: &str) -> Result<Self> {
+        let mut parts = segment.split('/');
+        let market_id = parts.next().map(str::trim).unwrap_or_default();
+        let account_id = parts.next().map(str::trim).unwrap_or_default();
+
+        if parts.next().is_some() {
+            return Err(LighterError::Config(format!(
+                "Invalid account market subscription `{raw}`"
+            )));
+        }
+
+        Self::parse_market_parts(market_id, account_id, raw)
+    }
+
+    fn parse_market_parts(market_id: &str, account_id: &str, raw: &str) -> Result<Self> {
+        if market_id.is_empty() || account_id.is_empty() {
+            return Err(LighterError::Config(format!(
+                "Invalid account market subscription `{raw}`"
+            )));
+        }
+
+        Ok(Self::AccountMarket {
+            market_id: market_id.to_string(),
+            account_id: account_id.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AccountChannelMeta {
+    key: String,
+    requires_auth: bool,
+}
+
+impl AccountChannelMeta {
+    fn new(key: String, requires_auth: bool) -> Self {
+        Self {
+            key,
+            requires_auth,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsRequest {
@@ -43,6 +146,10 @@ enum WsMessage {
     SubscribedAccountAll,
     #[serde(rename = "update/account_all")]
     UpdateAccountAll,
+    #[serde(rename = "subscribed/account_market")]
+    SubscribedAccountMarket,
+    #[serde(rename = "update/account_market")]
+    UpdateAccountMarket,
     #[serde(rename = "subscribed/trade")]
     SubscribedTrade,
     #[serde(rename = "update/trade")]
@@ -72,6 +179,8 @@ where
 {
     stream: WsStream,
     subscriptions: HashMap<WsSubscriptionType, HashMap<String, Option<Value>>>,
+    account_channels: HashMap<String, AccountChannelMeta>,
+    signer: Option<FFISigner>,
     on_order_book_update: Option<F1>,
     on_account_update: Option<F2>,
     on_trade_update: Option<F3>,
@@ -110,6 +219,10 @@ where
         self
     }
 
+    /// Registers account subscriptions.
+    ///
+    /// Entries can be plain account identifiers (e.g. `40` or `account_all/40`) or
+    /// market-specific tuples (e.g. `0/40` or `account_market/0/40`).
     pub fn with_accounts_subs(mut self, account_subs: Vec<String>, account_update_fn: F2) -> Self {
         self.accounts_subs = Some((account_subs, account_update_fn));
         self
@@ -136,6 +249,8 @@ where
             .map_err(|e| LighterError::WebSocket(Box::new(e)))?;
 
         let mut subs = HashMap::new();
+        let mut account_channels = HashMap::new();
+        let mut needs_auth_token = false;
 
         let mut on_order_book_update = None;
         if let Some((order_books_subs, handler)) = self.order_books_subs {
@@ -149,11 +264,48 @@ where
 
         let mut on_account_update = None;
         if let Some((account_subs, handler)) = self.accounts_subs {
-            let account_subs = account_subs
-                .iter()
-                .map(|v| (v.to_string(), None))
-                .collect::<HashMap<_, _>>();
-            subs.insert(WsSubscriptionType::Accounts, account_subs);
+            if account_subs.is_empty() {
+                return Err(LighterError::Config(
+                    "Expected at least one account subscription".into(),
+                ));
+            }
+
+            let mut account_states = HashMap::new();
+
+            for raw_sub in account_subs {
+                let subscription = AccountSubscription::parse(&raw_sub)?;
+                match subscription {
+                    AccountSubscription::AccountAll { account_id } => {
+                        let key = account_id.clone();
+                        let channel = format!("account_all/{account_id}");
+                        account_channels
+                            .entry(channel)
+                            .or_insert_with(|| AccountChannelMeta::new(key.clone(), true));
+                        account_states.entry(key).or_insert(None);
+                        needs_auth_token = true;
+                    }
+                    AccountSubscription::AccountMarket {
+                        market_id,
+                        account_id,
+                    } => {
+                        let key = format!("{market_id}/{account_id}");
+                        let channel = format!("account_market/{market_id}/{account_id}");
+                        account_channels
+                            .entry(channel)
+                            .or_insert_with(|| AccountChannelMeta::new(key.clone(), true));
+                        account_states.entry(key).or_insert(None);
+                        needs_auth_token = true;
+                    }
+                }
+            }
+
+            if account_states.is_empty() {
+                return Err(LighterError::Config(
+                    "No valid account subscriptions provided".into(),
+                ));
+            }
+
+            subs.insert(WsSubscriptionType::Accounts, account_states);
             on_account_update = Some(handler);
         }
 
@@ -167,9 +319,17 @@ where
             on_trade_update = Some(handler);
         }
 
+        let signer = if needs_auth_token {
+            Some(FFISigner::try_from(&config)?)
+        } else {
+            None
+        };
+
         Ok(WsClient {
             stream: ws_stream,
             subscriptions: subs,
+            account_channels,
+            signer,
             on_order_book_update,
             on_account_update,
             on_trade_update,
@@ -228,9 +388,17 @@ where
                         }
                         WsMessage::UpdateOrderBook => self.handle_update_order_book(msg).await?,
                         WsMessage::SubscribedAccountAll => {
-                            self.handle_subscribed_account_all().await?
+                            self.handle_subscribed_account_all(msg).await?
                         }
-                        WsMessage::UpdateAccountAll => self.handle_update_account_all().await?,
+                        WsMessage::UpdateAccountAll => {
+                            self.handle_update_account_all(msg).await?
+                        }
+                        WsMessage::SubscribedAccountMarket => {
+                            self.handle_subscribed_account_market(msg).await?
+                        }
+                        WsMessage::UpdateAccountMarket => {
+                            self.handle_update_account_market(msg).await?
+                        }
                         WsMessage::SubscribedTrade | WsMessage::UpdateTrade => {
                             self.handle_trade_message(msg).await?
                         }
@@ -253,7 +421,6 @@ where
 
     async fn handle_connected(&mut self) -> Result<()> {
         let order_book_subs = self.subscriptions.get(&WsSubscriptionType::OrderBooks);
-        let accounts_subs = self.subscriptions.get(&WsSubscriptionType::Accounts);
         let trade_subs = self.subscriptions.get(&WsSubscriptionType::Trades);
 
         if let Some(order_books_subs) = order_book_subs {
@@ -264,22 +431,54 @@ where
                     .send(Message::text(resp.to_string()))
                     .await
                     .map_err(|e| {
-                        tracing::error!("unable to send `connected` response: {e}");
-                        LighterError::Generic("Unable to send `connected` response: {e}".into())
+                        tracing::error!("unable to send `connected` response: {}", e);
+                        LighterError::Generic(format!(
+                            "Unable to send `connected` response: {e}"
+                        ))
                     })?;
             }
         }
 
-        if let Some(accounts_subs) = accounts_subs {
-            for account_id in accounts_subs.keys() {
-                let resp =
-                    json!({"type": "subscribe", "channel": format!("account_all/{account_id}")});
+        if !self.account_channels.is_empty() {
+            let channels: Vec<(String, bool)> = self
+                .account_channels
+                .iter()
+                .map(|(channel, meta)| (channel.clone(), meta.requires_auth))
+                .collect();
+            let mut cached_auth: Option<String> = None;
+
+            for (channel, requires_auth) in channels {
+                let mut payload = json!({"type": "subscribe", "channel": channel});
+
+                if requires_auth {
+                    let signer = self.signer.as_ref().ok_or_else(|| {
+                        tracing::error!("account market subscriptions require auth");
+                        LighterError::Auth(
+                            "Account market subscriptions require authenticated config".into(),
+                        )
+                    })?;
+
+                    let token = if let Some(token) = cached_auth.clone() {
+                        token
+                    } else {
+                        let fresh = signer.get_auth_token(None)?;
+                        cached_auth = Some(fresh.clone());
+                        fresh
+                    };
+
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("auth".into(), Value::String(token));
+                    }
+                }
+
                 self.stream
-                    .send(Message::text(resp.to_string()))
+                    .send(Message::text(payload.to_string()))
                     .await
                     .map_err(|e| {
-                        tracing::error!("unable to send `connected` response: {e}");
-                        LighterError::Generic("Unable to send `connected` response: {e}".into())
+                        tracing::error!("unable to send `connected` response: {}", e);
+                        LighterError::Generic(format!(
+                            "Unable to send `connected` response: {e}"
+                        ))
                     })?;
             }
         }
@@ -291,8 +490,10 @@ where
                     .send(Message::text(resp.to_string()))
                     .await
                     .map_err(|e| {
-                        tracing::error!("unable to send `connected` response: {e}");
-                        LighterError::Generic("Unable to send `connected` response: {e}".into())
+                        tracing::error!("unable to send `connected` response: {}", e);
+                        LighterError::Generic(format!(
+                            "Unable to send `connected` response: {e}"
+                        ))
                     })?;
             }
         }
@@ -326,17 +527,51 @@ where
         self.update_order_book_state(market_id, order_book)
     }
 
-    async fn handle_subscribed_account_all(&mut self) -> Result<()> {
-        Ok(())
+    async fn handle_subscribed_account_all(&mut self, msg: Value) -> Result<()> {
+        self.handle_account_message(msg)
     }
 
-    async fn handle_update_account_all(&mut self) -> Result<()> {
-        Ok(())
+    async fn handle_update_account_all(&mut self, msg: Value) -> Result<()> {
+        self.handle_account_message(msg)
     }
 
-    // async fn handle_ping(&mut self) -> Result<()> {
-    //     Ok(())
-    // }
+    async fn handle_subscribed_account_market(&mut self, msg: Value) -> Result<()> {
+        self.handle_account_message(msg)
+    }
+
+    async fn handle_update_account_market(&mut self, msg: Value) -> Result<()> {
+        self.handle_account_message(msg)
+    }
+
+    fn handle_account_message(&mut self, msg: Value) -> Result<()> {
+        let channel = msg
+            .get("channel")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                tracing::error!("account message missing `channel`");
+                LighterError::Generic("Account message missing `channel`".into())
+            })?
+            .to_string();
+
+        let meta = self.account_channels.get(&channel);
+
+        if let Some(meta) = meta {
+            if let Some(accounts_subs) = self.subscriptions.get_mut(&WsSubscriptionType::Accounts) {
+                accounts_subs.insert(meta.key.clone(), Some(msg.clone()));
+            }
+        }
+
+        if let Some(handler) = &self.on_account_update {
+            let key = meta
+                .map(|meta| meta.key.clone())
+                .unwrap_or_else(|| channel.clone());
+            handler(key, msg);
+        } else if meta.is_none() {
+            tracing::warn!("received account payload for unsubscribed channel `{channel}`");
+        }
+
+        Ok(())
+    }
 
     async fn handle_trade_message(&mut self, msg: Value) -> Result<()> {
         let market_id = Self::extract_market_id(&msg)?;
@@ -498,5 +733,43 @@ where
                 tracing::error!("Unable to get market_id");
                 LighterError::Generic("Unable to get market_id".into())
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_account_all_inputs() {
+        for input in ["40", "account_all/40", "/account_all/40/"] {
+            match AccountSubscription::parse(input).expect("valid account id") {
+                AccountSubscription::AccountAll { account_id } => assert_eq!(account_id, "40"),
+                _ => panic!("expected account_all"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_account_market_inputs() {
+        for input in ["0/40", "account_market/0/40", "/account_market/0/40/"] {
+            match AccountSubscription::parse(input).expect("valid account market") {
+                AccountSubscription::AccountMarket {
+                    market_id,
+                    account_id,
+                } => {
+                    assert_eq!(market_id, "0");
+                    assert_eq!(account_id, "40");
+                }
+                _ => panic!("expected account_market"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_inputs() {
+        assert!(AccountSubscription::parse("account_market/0").is_err());
+        assert!(AccountSubscription::parse("account_market//40").is_err());
+        assert!(AccountSubscription::parse("").is_err());
     }
 }

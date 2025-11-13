@@ -78,7 +78,7 @@ impl FFISigner {
                     data.reduce_only as c_int,
                     data.trigger_price,
                     data.order_expiry as c_longlong,
-                    1,
+                    nonce,
                 )
             },
             TxData::SignCreateGroupedOrders(mut data) => {
