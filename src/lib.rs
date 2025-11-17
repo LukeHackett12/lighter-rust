@@ -49,4 +49,7 @@ pub use config::LighterConfig;
 mod error;
 pub use error::{LighterError, Result};
 
-pub use crate::{client::{HttpClient, WsClient}, signer::Signer};
+pub use crate::{
+    client::{HttpClient, WsClient},
+    signer::Signer,
+};

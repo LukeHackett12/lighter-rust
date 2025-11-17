@@ -32,6 +32,7 @@ fn main() {
     {
         println!("cargo:rustc-link-search=native={dir}/libs/darwin/arm64");
         println!("cargo:rustc-link-lib=dylib=lighter-signer");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}/libs/darwin/arm64");
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {

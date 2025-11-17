@@ -14,8 +14,13 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug)]
 enum AccountSubscription {
-    AccountAll { account_id: String },
-    AccountMarket { market_id: String, account_id: String },
+    AccountAll {
+        account_id: String,
+    },
+    AccountMarket {
+        market_id: String,
+        account_id: String,
+    },
 }
 
 impl AccountSubscription {
@@ -107,31 +112,8 @@ struct AccountChannelMeta {
 
 impl AccountChannelMeta {
     fn new(key: String, requires_auth: bool) -> Self {
-        Self {
-            key,
-            requires_auth,
-        }
+        Self { key, requires_auth }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsRequest {
-    pub method: String,
-    pub params: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsResponse {
-    pub id: Option<String>,
-    pub result: Option<Value>,
-    pub error: Option<WsError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsError {
-    pub code: i32,
-    pub message: String,
-    pub data: Option<Value>,
 }
 
 #[derive(Debug, strum::Display, Serialize, Deserialize)]
@@ -163,12 +145,6 @@ enum WsSubscriptionType {
     Accounts,
     Trades,
 }
-
-// #[derive(Debug)]
-// struct WsSubscription {
-//     id: uuid::Uuid,
-//     pub state: Option<HashMap<String, Value>>,
-// }
 
 #[derive(Debug)]
 pub struct WsClient<F1, F2, F3>
@@ -390,9 +366,7 @@ where
                         WsMessage::SubscribedAccountAll => {
                             self.handle_subscribed_account_all(msg).await?
                         }
-                        WsMessage::UpdateAccountAll => {
-                            self.handle_update_account_all(msg).await?
-                        }
+                        WsMessage::UpdateAccountAll => self.handle_update_account_all(msg).await?,
                         WsMessage::SubscribedAccountMarket => {
                             self.handle_subscribed_account_market(msg).await?
                         }
@@ -402,14 +376,17 @@ where
                         WsMessage::SubscribedTrade | WsMessage::UpdateTrade => {
                             self.handle_trade_message(msg).await?
                         }
-                        WsMessage::Ping => self
-                            .stream
-                            .send(Message::text(json!({"type": "pong"}).to_string()))
-                            .await
-                            .map_err(|e| {
-                                tracing::error!("unable to send `pong`");
-                                LighterError::Generic("Unable to send `pong`".into())
-                            })?,
+                        WsMessage::Ping => {
+                            tracing::debug!("ws ping received; sending pong response");
+                            self.stream
+                                .send(Message::text(json!({"type": "pong"}).to_string()))
+                                .await
+                                .map_err(|e| {
+                                    tracing::error!("unable to send `pong: {:?}", e);
+                                    LighterError::Generic("Unable to send `pong`".into())
+                                })?;
+                            tracing::debug!("ws pong response transmitted");
+                        }
                     }
                 }
 
@@ -432,9 +409,7 @@ where
                     .await
                     .map_err(|e| {
                         tracing::error!("unable to send `connected` response: {}", e);
-                        LighterError::Generic(format!(
-                            "Unable to send `connected` response: {e}"
-                        ))
+                        LighterError::Generic(format!("Unable to send `connected` response: {e}"))
                     })?;
             }
         }
@@ -476,9 +451,7 @@ where
                     .await
                     .map_err(|e| {
                         tracing::error!("unable to send `connected` response: {}", e);
-                        LighterError::Generic(format!(
-                            "Unable to send `connected` response: {e}"
-                        ))
+                        LighterError::Generic(format!("Unable to send `connected` response: {e}"))
                     })?;
             }
         }
@@ -491,9 +464,7 @@ where
                     .await
                     .map_err(|e| {
                         tracing::error!("unable to send `connected` response: {}", e);
-                        LighterError::Generic(format!(
-                            "Unable to send `connected` response: {e}"
-                        ))
+                        LighterError::Generic(format!("Unable to send `connected` response: {e}"))
                     })?;
             }
         }
@@ -503,26 +474,20 @@ where
 
     async fn handle_subscribed_order_book(&mut self, msg: Value) -> Result<()> {
         let market_id = Self::extract_market_id(&msg)?;
-        let order_book = msg
-            .get("order_book")
-            .cloned()
-            .ok_or_else(|| {
-                tracing::error!("unable to get order_book from message");
-                LighterError::Generic("Unable to get `order_book` from message".into())
-            })?;
+        let order_book = msg.get("order_book").cloned().ok_or_else(|| {
+            tracing::error!("unable to get order_book from message");
+            LighterError::Generic("Unable to get `order_book` from message".into())
+        })?;
 
         self.update_order_book_state(market_id, order_book)
     }
 
     async fn handle_update_order_book(&mut self, msg: Value) -> Result<()> {
         let market_id = Self::extract_market_id(&msg)?;
-        let order_book = msg
-            .get("order_book")
-            .cloned()
-            .ok_or_else(|| {
-                tracing::error!("unable to get order_book update from message");
-                LighterError::Generic("Unable to get `order_book` update from message".into())
-            })?;
+        let order_book = msg.get("order_book").cloned().ok_or_else(|| {
+            tracing::error!("unable to get order_book update from message");
+            LighterError::Generic("Unable to get `order_book` update from message".into())
+        })?;
 
         self.update_order_book_state(market_id, order_book)
     }
@@ -687,12 +652,7 @@ where
     }
 
     fn is_zero_level(order: &Value) -> bool {
-        const AMOUNT_FIELDS: [&str; 4] = [
-            "remaining_base_amount",
-            "size",
-            "quantity",
-            "qty",
-        ];
+        const AMOUNT_FIELDS: [&str; 4] = ["remaining_base_amount", "size", "quantity", "qty"];
 
         if let Some(action) = order.get("action").and_then(|v| v.as_str()) {
             if action.eq_ignore_ascii_case("delete") {
@@ -716,13 +676,10 @@ where
     }
 
     fn extract_market_id(msg: &Value) -> Result<String> {
-        let channel = msg
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                tracing::error!("Unable to get channel from message");
-                LighterError::Generic("Unable to get channel from message".into())
-            })?;
+        let channel = msg.get("channel").and_then(|v| v.as_str()).ok_or_else(|| {
+            tracing::error!("Unable to get channel from message");
+            LighterError::Generic("Unable to get channel from message".into())
+        })?;
 
         channel
             .split(|c| c == ':' || c == '/')
